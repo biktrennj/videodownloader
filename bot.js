@@ -102,18 +102,22 @@ async function getYouTubeFormats(url) {
                 const info = JSON.parse(stdout);
                 const formats = info.formats || [];
                 
-                // Filter video formats dengan berbagai resolusi
-                const videoFormats = formats.filter(f => 
-                    f.vcodec !== 'none' && f.acodec === 'none' && f.ext === 'mp4'
-                );
+                // Filter video formats, URUTKAN DARI RESOLUSI TERTINGGI
+                let videoFormats = formats
+                    .filter(f => f.vcodec !== 'none' && f.acodec === 'none' && f.ext === 'mp4' && f.height)
+                    .sort((a, b) => b.height - a.height);
                 
-                const audioFormat = formats.find(f => 
-                    f.acodec !== 'none' && f.vcodec === 'none'
-                );
+                // Hapus duplikat resolusi yang sama
+                const uniqueHeights = new Set();
+                videoFormats = videoFormats.filter(f => {
+                    if (uniqueHeights.has(f.height)) return false;
+                    uniqueHeights.add(f.height);
+                    return true;
+                });
                 
                 resolve({
                     title: info.title,
-                    formats: videoFormats.slice(0, 5), // ambil 5 format terbaik
+                    formats: videoFormats.slice(0, 4), // ambil 4 resolusi terbaik
                     audioFormat: audioFormat,
                     downloadUrl: url
                 });
@@ -212,25 +216,22 @@ bot.on('text', async (ctx) => {
             await edit('⏳ Mengambil info video YouTube...');
             const ytInfo = await getYouTubeFormats(targetUrl);
             
-            const sessionId = `yt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            // PERBAIKAN: Gunakan ID tanpa garis bawah agar tidak bentrok dengan Regex
+            const sessionId = Date.now().toString(36); 
             pendingDownloads.set(sessionId, { url: targetUrl, title: ytInfo.title, type: 'youtube', formats: ytInfo.formats });
             
-            // 2. PERBAIKAN TOMBOL: Susun tombol secara vertikal (array of arrays)
-            // Dan gunakan filesize_approx karena YouTube sering menyembunyikan filesize aslinya
-            const buttons = ytInfo.formats.slice(0, 3).map((fmt) => {
+            const buttons = ytInfo.formats.map((fmt) => {
                 const size = fmt.filesize || fmt.filesize_approx || 0;
-                const sizeStr = size > 0 ? `${(size / 1024 / 1024).toFixed(1)}MB` : 'Ukuran tidak diketahui';
+                const sizeStr = size > 0 ? `${(size / 1024 / 1024).toFixed(1)}MB` : '~MB';
                 
                 return [Markup.button.callback(
                     `📹 ${fmt.height}p (${sizeStr})`,
-                    `yt_res_${sessionId}_${fmt.format_id}`
+                    `ytres_${sessionId}_${fmt.format_id}` // Hapus underscore tambahan
                 )];
             });
             
-            // Tambahkan tombol audio di baris paling bawah
-            buttons.push([Markup.button.callback(`🎵 Audio Only`, `yt_audio_${sessionId}`)]);
+            buttons.push([Markup.button.callback(`🎵 Audio Only`, `ytaud_${sessionId}`)]);
             
-            // 3. PANGGIL FUNGSI EDIT YANG SUDAH DIPERBAIKI
             await edit(
                 `🎬 ${ytInfo.title}\n\nPilih resolusi atau download audio saja:`,
                 Markup.inlineKeyboard(buttons)
@@ -288,14 +289,14 @@ bot.on('text', async (ctx) => {
 });
 
 // ============================================================
-// CALLBACK HANDLER - Untuk pilihan resolusi YouTube
+// CALLBACK HANDLER
 // ============================================================
-bot.action(/^yt_res_(.+?)_(.+?)$/, async (ctx) => {
+bot.action(/^ytres_(.+?)_(.+?)$/, async (ctx) => {
     const [, sessionId, formatId] = ctx.match;
     const session = pendingDownloads.get(sessionId);
     
     if (!session) {
-        return ctx.answerCbQuery('❌ Session expired. Kirim link lagi.', { show_alert: true });
+        return ctx.answerCbQuery('❌ Session expired. Server mungkin baru direstart. Kirim link lagi.', { show_alert: true });
     }
     
     await ctx.answerCbQuery('⏳ Mendownload video...');
@@ -306,6 +307,32 @@ bot.action(/^yt_res_(.+?)_(.+?)$/, async (ctx) => {
         await ctx.replyWithVideo(
             { source: result.buffer, filename: 'youtube.mp4' },
             { caption: `🎬 ${session.title}\n📏 ${result.sizeMB}MB\n\nPowered by Naufal Tech` }
+        );
+        
+        pendingDownloads.delete(sessionId);
+        await ctx.deleteMessage();
+        
+    } catch (error) {
+        ctx.answerCbQuery(`❌ ${error.message}`, { show_alert: true });
+    }
+});
+
+bot.action(/^ytaud_(.+?)$/, async (ctx) => {
+    const sessionId = ctx.match[1];
+    const session = pendingDownloads.get(sessionId);
+    
+    if (!session) {
+        return ctx.answerCbQuery('❌ Session expired. Kirim link lagi.', { show_alert: true });
+    }
+    
+    await ctx.answerCbQuery('⏳ Mendownload audio...');
+    
+    try {
+        const result = await downloadYouTubeWithFormat(session.url, null, true);
+        
+        await ctx.replyWithAudio(
+            { source: result.buffer, filename: 'audio.mp3' },
+            { caption: `🎵 ${session.title}\n\nPowered by Naufal Tech` }
         );
         
         pendingDownloads.delete(sessionId);
