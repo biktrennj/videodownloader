@@ -90,7 +90,8 @@ async function downloadFacebook(url) {
 // ============================================================
 async function getYouTubeFormats(url) {
     return new Promise((resolve, reject) => {
-        const cmd = `yt-dlp -j "${url}"`;
+        // TAMBAHAN: --no-playlist agar tidak mengambil seluruh video di playlist/mix
+        const cmd = `yt-dlp --no-playlist -j "${url}"`;
         
         exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
             if (error) {
@@ -131,12 +132,13 @@ async function downloadYouTubeWithFormat(url, formatId = null, audioOnly = false
         const outputPath = path.join(outputDir, `video_${Date.now()}.${audioOnly ? 'mp3' : 'mp4'}`);
         
         let cmd;
+        // TAMBAHAN: Selalu gunakan --no-playlist di setiap eksekusi download
         if (audioOnly) {
-            cmd = `yt-dlp -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K -o "${outputPath}" "${url}" --quiet --no-warnings`;
+            cmd = `yt-dlp --no-playlist -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K -o "${outputPath}" "${url}" --quiet --no-warnings`;
         } else if (formatId) {
-            cmd = `yt-dlp -f "${formatId}+bestaudio/best" --merge-output-format mp4 -o "${outputPath}" "${url}" --quiet --no-warnings`;
+            cmd = `yt-dlp --no-playlist -f "${formatId}+bestaudio/best" --merge-output-format mp4 -o "${outputPath}" "${url}" --quiet --no-warnings`;
         } else {
-            cmd = `yt-dlp -f "best[ext=mp4]/best" -o "${outputPath}" "${url}" --quiet --no-warnings`;
+            cmd = `yt-dlp --no-playlist -f "best[ext=mp4]/best" -o "${outputPath}" "${url}" --quiet --no-warnings`;
         }
         
         console.log('[YT] Running:', cmd.substring(0, 100) + '...');
@@ -201,31 +203,37 @@ bot.on('text', async (ctx) => {
 
     const loadingMsg = await ctx.reply('⏳ Sedang menganalisis link...');
     const msgId = loadingMsg.message_id;
-    const edit = (text) => ctx.telegram.editMessageText(ctx.chat.id, msgId, undefined, text);
+    // 1. PERBAIKAN HELPER: Tambahkan parameter 'extra'
+    const edit = (text, extra) => ctx.telegram.editMessageText(ctx.chat.id, msgId, undefined, text, extra);
 
     try {
         // YOUTUBE - Tampilkan pilihan resolusi
-        if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+        if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be') || targetUrl.includes('youtube-nocookie.com')) {
             await edit('⏳ Mengambil info video YouTube...');
             const ytInfo = await getYouTubeFormats(targetUrl);
             
             const sessionId = `yt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
             pendingDownloads.set(sessionId, { url: targetUrl, title: ytInfo.title, type: 'youtube', formats: ytInfo.formats });
             
-            // Buat keyboard dengan pilihan resolusi
-            const buttons = [
-                ...ytInfo.formats.slice(0, 3).map((fmt, idx) => 
-                    Markup.button.callback(
-                        `📹 ${fmt.height}p (${(fmt.filesize / 1024 / 1024).toFixed(0)}MB)`,
-                        `yt_res_${sessionId}_${fmt.format_id}`
-                    )
-                ),
-                Markup.button.callback(`🎵 Audio Only`, `yt_audio_${sessionId}`),
-            ];
+            // 2. PERBAIKAN TOMBOL: Susun tombol secara vertikal (array of arrays)
+            // Dan gunakan filesize_approx karena YouTube sering menyembunyikan filesize aslinya
+            const buttons = ytInfo.formats.slice(0, 3).map((fmt) => {
+                const size = fmt.filesize || fmt.filesize_approx || 0;
+                const sizeStr = size > 0 ? `${(size / 1024 / 1024).toFixed(1)}MB` : 'Ukuran tidak diketahui';
+                
+                return [Markup.button.callback(
+                    `📹 ${fmt.height}p (${sizeStr})`,
+                    `yt_res_${sessionId}_${fmt.format_id}`
+                )];
+            });
             
+            // Tambahkan tombol audio di baris paling bawah
+            buttons.push([Markup.button.callback(`🎵 Audio Only`, `yt_audio_${sessionId}`)]);
+            
+            // 3. PANGGIL FUNGSI EDIT YANG SUDAH DIPERBAIKI
             await edit(
                 `🎬 ${ytInfo.title}\n\nPilih resolusi atau download audio saja:`,
-                Markup.inlineKeyboard([buttons])
+                Markup.inlineKeyboard(buttons)
             );
         }
         
