@@ -69,16 +69,21 @@ async function downloadFacebook(url) {
     );
 
     const data = res.data;
-    console.log('[FB] Response:', JSON.stringify(data).substring(0, 300));
+    console.log('[FB] Response status:', data.status);
 
+    // Cek struktur response
+    if (data?.direct_media_url) {
+        console.log('[FB] Found direct_media_url');
+        return { url: data.direct_media_url, needsBuffer: true };
+    }
     if (data?.url) return { url: data.url, needsBuffer: true };
     if (data?.video) return { url: data.video, needsBuffer: true };
     if (data?.download_url) return { url: data.download_url, needsBuffer: true };
     if (data?.result?.url) return { url: data.result.url, needsBuffer: true };
     if (Array.isArray(data?.media) && data.media[0]?.url) return { url: data.media[0].url, needsBuffer: true };
     
-    console.log('[FB] Full response:', JSON.stringify(data));
-    throw new Error('Video Facebook tidak ditemukan. Pastikan link public.');
+    console.log('[FB] Full response:', JSON.stringify(data).substring(0, 500));
+    throw new Error('Video Facebook tidak ditemukan. Pastikan link public dan media tersedia.');
 }
 
 // ============================================================
