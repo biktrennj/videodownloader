@@ -192,6 +192,9 @@ async function downloadTikTok(url) {
 // MAIN LISTENER
 // ============================================================
 bot.on('text', async (ctx) => {
+    // --- TAMBAHKAN BARIS INI ---
+    console.log('\n[DEBUG] Pesan masuk dari Telegram:', ctx.message.text);
+    // ---------------------------
     const urls = ctx.message.text.match(/(https?:\/\/[^\s]+)/g);
     if (!urls) return;
 
