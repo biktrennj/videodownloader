@@ -1,4 +1,4 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const { exec } = require('child_process');
 const fs = require('fs');
@@ -7,8 +7,11 @@ const path = require('path');
 const bot = new Telegraf('8616072860:AAGodrCY20EJRVCB5G2OTkeMr_xEko_ND8E');
 const RAPIDAPI_KEY = '476e61984dmsh72f55bfd0e8ff17p1319e0jsn3bc897bb50ec';
 
+// Store pending downloads (cache URL sementara)
+const pendingDownloads = new Map();
+
 bot.start((ctx) => {
-    ctx.reply('Halo! Kirimkan link video TikTok, Instagram Reels, Facebook, atau YouTube.');
+    ctx.reply('Halo! Kirimkan link video TikTok, Instagram Reels, Facebook, atau YouTube.\n\nKamu bisa pilih resolusi dan download audio saja.');
 });
 
 // ============================================================
@@ -47,7 +50,7 @@ async function downloadInstagram(url) {
 
     const videoOnly = data.medias?.filter(m => m.type === 'video');
     if (videoOnly && videoOnly.length > 0) {
-        return { url: videoOnly[0].url, title: data.title, author: data.author, needsBuffer: true };
+        return { url: videoOnly[0].url, title: data.title, author: data.author, needsBuffer: true, source: 'instagram' };
     }
     throw new Error('Video tidak ditemukan di response API.');
 }
@@ -71,33 +74,72 @@ async function downloadFacebook(url) {
     const data = res.data;
     console.log('[FB] Response status:', data.status);
 
-    // Cek struktur response
     if (data?.direct_media_url) {
         console.log('[FB] Found direct_media_url');
-        return { url: data.direct_media_url, needsBuffer: true };
+        return { url: data.direct_media_url, needsBuffer: true, source: 'facebook' };
     }
-    if (data?.url) return { url: data.url, needsBuffer: true };
-    if (data?.video) return { url: data.video, needsBuffer: true };
-    if (data?.download_url) return { url: data.download_url, needsBuffer: true };
-    if (data?.result?.url) return { url: data.result.url, needsBuffer: true };
-    if (Array.isArray(data?.media) && data.media[0]?.url) return { url: data.media[0].url, needsBuffer: true };
+    if (data?.url) return { url: data.url, needsBuffer: true, source: 'facebook' };
+    if (data?.video) return { url: data.video, needsBuffer: true, source: 'facebook' };
     
     console.log('[FB] Full response:', JSON.stringify(data).substring(0, 500));
     throw new Error('Video Facebook tidak ditemukan. Pastikan link public dan media tersedia.');
 }
 
 // ============================================================
-// YOUTUBE (via yt-dlp)
+// YOUTUBE (dengan berbagai resolusi)
 // ============================================================
-async function downloadYouTube(url) {
+async function getYouTubeFormats(url) {
+    return new Promise((resolve, reject) => {
+        const cmd = `yt-dlp -j "${url}"`;
+        
+        exec(cmd, { maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+            if (error) {
+                return reject(new Error('Gagal mendapatkan info video YouTube'));
+            }
+            
+            try {
+                const info = JSON.parse(stdout);
+                const formats = info.formats || [];
+                
+                // Filter video formats dengan berbagai resolusi
+                const videoFormats = formats.filter(f => 
+                    f.vcodec !== 'none' && f.acodec === 'none' && f.ext === 'mp4'
+                );
+                
+                const audioFormat = formats.find(f => 
+                    f.acodec !== 'none' && f.vcodec === 'none'
+                );
+                
+                resolve({
+                    title: info.title,
+                    formats: videoFormats.slice(0, 5), // ambil 5 format terbaik
+                    audioFormat: audioFormat,
+                    downloadUrl: url
+                });
+            } catch(e) {
+                reject(new Error('Gagal parse info YouTube'));
+            }
+        });
+    });
+}
+
+async function downloadYouTubeWithFormat(url, formatId = null, audioOnly = false) {
     return new Promise((resolve, reject) => {
         const outputDir = path.join(__dirname, 'temp');
         if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
         
-        const outputPath = path.join(outputDir, `video_${Date.now()}.mp4`);
-        const cmd = `yt-dlp -f "best[ext=mp4]/best" -o "${outputPath}" "${url}" --quiet --no-warnings`;
+        const outputPath = path.join(outputDir, `video_${Date.now()}.${audioOnly ? 'mp3' : 'mp4'}`);
         
-        console.log('[YT] Running:', cmd);
+        let cmd;
+        if (audioOnly) {
+            cmd = `yt-dlp -f "bestaudio/best" -x --audio-format mp3 --audio-quality 192K -o "${outputPath}" "${url}" --quiet --no-warnings`;
+        } else if (formatId) {
+            cmd = `yt-dlp -f "${formatId}+bestaudio/best" --merge-output-format mp4 -o "${outputPath}" "${url}" --quiet --no-warnings`;
+        } else {
+            cmd = `yt-dlp -f "best[ext=mp4]/best" -o "${outputPath}" "${url}" --quiet --no-warnings`;
+        }
+        
+        console.log('[YT] Running:', cmd.substring(0, 100) + '...');
         
         const timeout = setTimeout(() => {
             reject(new Error('Download timeout (lebih dari 5 menit)'));
@@ -108,20 +150,36 @@ async function downloadYouTube(url) {
             
             if (error) {
                 console.error('[YT] Error:', error.message);
-                return reject(new Error('Download YouTube gagal. Video mungkin private/blocked.'));
+                return reject(new Error('Download YouTube gagal.'));
             }
             
             if (!fs.existsSync(outputPath)) {
-                return reject(new Error('File video tidak ditemukan setelah download.'));
+                return reject(new Error('File tidak ditemukan setelah download.'));
             }
             
             const buffer = fs.readFileSync(outputPath);
             fs.unlinkSync(outputPath);
             
-            console.log(`[YT] Success: ${(buffer.length / 1024 / 1024).toFixed(1)}MB`);
-            resolve({ buffer, title: 'YouTube Video' });
+            const sizeMB = (buffer.length / 1024 / 1024).toFixed(1);
+            console.log(`[YT] Success: ${sizeMB}MB`);
+            resolve({ buffer, title: 'YouTube Video', sizeMB });
         });
     });
+}
+
+// ============================================================
+// TIKTOK
+// ============================================================
+async function downloadTikTok(url) {
+    const res = await axios.post('https://www.tikwm.com/api/', 
+        { url: url, hd: 1 }, 
+        { timeout: 15000 }
+    );
+    if (res.data.code === 0 && res.data.data?.play) {
+        return { url: res.data.data.play, needsBuffer: false, source: 'tiktok' };
+    } else {
+        throw new Error('Video TikTok tidak ditemukan atau akun privat.');
+    }
 }
 
 // ============================================================
@@ -141,76 +199,139 @@ bot.on('text', async (ctx) => {
 
     if (!isValid) return ctx.reply('⚠️ Mendukung TikTok, Instagram, Facebook, dan YouTube.');
 
-    const loadingMsg = await ctx.reply('⏳ Sedang memproses, mohon tunggu...');
-    const edit = (text) => ctx.telegram.editMessageText(ctx.chat.id, loadingMsg.message_id, undefined, text);
+    const loadingMsg = await ctx.reply('⏳ Sedang menganalisis link...');
+    const msgId = loadingMsg.message_id;
+    const edit = (text) => ctx.telegram.editMessageText(ctx.chat.id, msgId, undefined, text);
 
     try {
-        let result;
-
-        // ── TIKTOK ──
-        if (targetUrl.includes('tiktok.com') || targetUrl.includes('vt.tiktok.com')) {
-            const res = await axios.post('https://www.tikwm.com/api/', 
-                { url: targetUrl, hd: 1 }, 
-                { timeout: 15000 }
+        // YOUTUBE - Tampilkan pilihan resolusi
+        if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
+            await edit('⏳ Mengambil info video YouTube...');
+            const ytInfo = await getYouTubeFormats(targetUrl);
+            
+            const sessionId = `yt_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            pendingDownloads.set(sessionId, { url: targetUrl, title: ytInfo.title, type: 'youtube', formats: ytInfo.formats });
+            
+            // Buat keyboard dengan pilihan resolusi
+            const buttons = [
+                ...ytInfo.formats.slice(0, 3).map((fmt, idx) => 
+                    Markup.button.callback(
+                        `📹 ${fmt.height}p (${(fmt.filesize / 1024 / 1024).toFixed(0)}MB)`,
+                        `yt_res_${sessionId}_${fmt.format_id}`
+                    )
+                ),
+                Markup.button.callback(`🎵 Audio Only`, `yt_audio_${sessionId}`),
+            ];
+            
+            await edit(
+                `🎬 ${ytInfo.title}\n\nPilih resolusi atau download audio saja:`,
+                Markup.inlineKeyboard([buttons])
             );
-            if (res.data.code === 0 && res.data.data?.play) {
-                result = { url: res.data.data.play, buffer: null, needsBuffer: false };
-            } else throw new Error('Video TikTok tidak ditemukan atau akun privat.');
         }
-        // ── INSTAGRAM ──
-        else if (targetUrl.includes('instagram.com')) {
-            result = await downloadInstagram(targetUrl);
-        }
-        // ── FACEBOOK ──
-        else if (targetUrl.includes('facebook.com') || targetUrl.includes('fb.watch')) {
-            result = await downloadFacebook(targetUrl);
-        }
-        // ── YOUTUBE ──
-        else if (targetUrl.includes('youtube.com') || targetUrl.includes('youtu.be')) {
-            await edit('⏳ Download YouTube bisa lama, mohon tunggu (5-10 menit)...');
-            result = await downloadYouTube(targetUrl);
-        }
-
-        if (!result) throw new Error('Gagal mendapatkan media.');
-
-        await edit('✅ Download selesai! Mengirim...');
-
-        if (result.buffer) {
-            // Kirim dari buffer (untuk YouTube)
-            await ctx.replyWithVideo(
-                { source: result.buffer, filename: 'video.mp4' },
-                { caption: result.title || 'Powered by Naufal Tech' }
-            );
-        } else if (result.needsBuffer) {
-            // Download dulu baru kirim (untuk IG, FB)
+        
+        // TIKTOK - Langsung download
+        else if (targetUrl.includes('tiktok.com') || targetUrl.includes('vt.tiktok.com')) {
+            await edit('⏳ Mengunduh dari TikTok...');
+            const result = await downloadTikTok(targetUrl);
             const buffer = await downloadToBuffer(result.url);
-            const fileSizeMB = (buffer.length / 1024 / 1024).toFixed(1);
-            console.log(`[Bot] Video size: ${fileSizeMB}MB`);
             
             await ctx.replyWithVideo(
-                { source: buffer, filename: 'video.mp4' },
+                { source: buffer, filename: 'tiktok.mp4' },
+                { caption: '🎵 TikTok Video\n\nPowered by Naufal Tech' }
+            );
+            
+            await ctx.telegram.deleteMessage(ctx.chat.id, msgId).catch(() => {});
+        }
+        
+        // INSTAGRAM - Langsung download
+        else if (targetUrl.includes('instagram.com')) {
+            await edit('⏳ Mengunduh dari Instagram...');
+            const result = await downloadInstagram(targetUrl);
+            const buffer = await downloadToBuffer(result.url);
+            
+            await ctx.replyWithVideo(
+                { source: buffer, filename: 'instagram.mp4' },
                 { 
-                    caption: result.title
-                        ? `🎬 ${result.title}\n👤 ${result.author || ''}\n\nPowered by Naufal Tech`
-                        : 'Powered by Naufal Tech'
+                    caption: `🎬 ${result.title}\n👤 ${result.author}\n\nPowered by Naufal Tech`
                 }
             );
-        } else {
-            // Kirim langsung dari URL (untuk TikTok)
-            await ctx.replyWithVideo(result.url, { 
-                caption: 'Powered by Naufal Tech'
-            });
+            
+            await ctx.telegram.deleteMessage(ctx.chat.id, msgId).catch(() => {});
         }
-
-        try {
-            await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id);
-        } catch(e) {
-            // ignore delete error
+        
+        // FACEBOOK - Langsung download
+        else if (targetUrl.includes('facebook.com') || targetUrl.includes('fb.watch')) {
+            await edit('⏳ Mengunduh dari Facebook...');
+            const result = await downloadFacebook(targetUrl);
+            const buffer = await downloadToBuffer(result.url);
+            
+            await ctx.replyWithVideo(
+                { source: buffer, filename: 'facebook.mp4' },
+                { caption: '🎬 Facebook Video\n\nPowered by Naufal Tech' }
+            );
+            
+            await ctx.telegram.deleteMessage(ctx.chat.id, msgId).catch(() => {});
         }
 
     } catch (error) {
         console.error('Error:', error.message);
         await edit(`❌ ${error.message}`);
+    }
+});
+
+// ============================================================
+// CALLBACK HANDLER - Untuk pilihan resolusi YouTube
+// ============================================================
+bot.action(/^yt_res_(.+?)_(.+?)$/, async (ctx) => {
+    const [, sessionId, formatId] = ctx.match;
+    const session = pendingDownloads.get(sessionId);
+    
+    if (!session) {
+        return ctx.answerCbQuery('❌ Session expired. Kirim link lagi.', { show_alert: true });
+    }
+    
+    await ctx.answerCbQuery('⏳ Mendownload video...');
+    
+    try {
+        const result = await downloadYouTubeWithFormat(session.url, formatId, false);
+        
+        await ctx.replyWithVideo(
+            { source: result.buffer, filename: 'youtube.mp4' },
+            { caption: `🎬 ${session.title}\n📏 ${result.sizeMB}MB\n\nPowered by Naufal Tech` }
+        );
+        
+        pendingDownloads.delete(sessionId);
+        await ctx.deleteMessage();
+        
+    } catch (error) {
+        ctx.answerCbQuery(`❌ ${error.message}`, { show_alert: true });
+    }
+});
+
+// Callback untuk audio only
+bot.action(/^yt_audio_(.+?)$/, async (ctx) => {
+    const sessionId = ctx.match[1];
+    const session = pendingDownloads.get(sessionId);
+    
+    if (!session) {
+        return ctx.answerCbQuery('❌ Session expired. Kirim link lagi.', { show_alert: true });
+    }
+    
+    await ctx.answerCbQuery('⏳ Mendownload audio...');
+    
+    try {
+        const result = await downloadYouTubeWithFormat(session.url, null, true);
+        
+        await ctx.replyWithAudio(
+            { source: result.buffer, filename: 'audio.mp3' },
+            { caption: `🎵 ${session.title}\n\nPowered by Naufal Tech` }
+        );
+        
+        pendingDownloads.delete(sessionId);
+        await ctx.deleteMessage();
+        
+    } catch (error) {
+        ctx.answerCbQuery(`❌ ${error.message}`, { show_alert: true });
     }
 });
 
